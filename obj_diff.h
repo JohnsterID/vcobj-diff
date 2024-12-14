@@ -99,6 +99,17 @@ struct Symbol {
 
     bool operator==(const Symbol& other) const;
     bool operator<(const Symbol& other) const;
+
+    nlohmann::json to_json() const {
+        return {
+            {"name", name},
+            {"value", value},
+            {"section_number", section_number},
+            {"type", type},
+            {"storage_class", storage_class},
+            {"aux_symbols", number_of_aux_symbols}
+        };
+    }
 };
 
 struct Section {

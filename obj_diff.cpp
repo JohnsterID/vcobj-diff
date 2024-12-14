@@ -164,7 +164,8 @@ std::string ObjFile::read_string(const std::vector<char>& string_table, uint32_t
     if (offset >= string_table.size()) {
         return "";
     }
-    return std::string(string_table.data() + offset);
+    const char* str = string_table.data() + offset;
+    return std::string(str, strnlen(str, string_table.size() - offset));
 }
 
 // ObjFile implementation
@@ -173,9 +174,7 @@ ObjFile ObjFile::parse(const std::string& filepath) {
     AssemblyDecoder decoder;
 
     try {
-        std::cout << "Attempting to parse: " << filepath << std::endl;
-        std::cout << "File size: " << fs::file_size(filepath) << " bytes" << std::endl;
-
+        std::cout << "Parsing file: " << filepath << std::endl;
         std::ifstream file(filepath, std::ios::binary);
         if (!file) {
             throw std::runtime_error("Cannot open file");
@@ -184,65 +183,81 @@ ObjFile ObjFile::parse(const std::string& filepath) {
         // Read COFF header
         COFF::Header coff_header;
         file.read(reinterpret_cast<char*>(&coff_header), sizeof(coff_header));
-        if (!file.good()) {
-            throw std::runtime_error("Failed to read COFF header");
-        }
 
-        // Validate machine type
-        if (coff_header.Machine != IMAGE_FILE_MACHINE_I386 &&
-            coff_header.Machine != IMAGE_FILE_MACHINE_AMD64) {
-            throw std::runtime_error(fmt::format("Unsupported machine type: 0x{:04x}",
-                coff_header.Machine));
-        }
+        std::cout << "COFF Header:" << std::endl;
+        std::cout << "  Number of symbols: " << coff_header.NumberOfSymbols << std::endl;
+        std::cout << "  Symbol table offset: 0x" << std::hex << coff_header.PointerToSymbolTable << std::dec << std::endl;
 
         // Read section headers
         std::vector<COFF::SectionHeader> section_headers(coff_header.NumberOfSections);
-        for (auto& section_header : section_headers) {
-            file.read(reinterpret_cast<char*>(&section_header), sizeof(COFF::SectionHeader));
-            if (!file.good()) {
-                throw std::runtime_error("Failed to read section header");
-            }
+        for (auto& header : section_headers) {
+            file.read(reinterpret_cast<char*>(&header), sizeof(COFF::SectionHeader));
         }
 
-        // Read string table
+        // First read string table size
         file.seekg(coff_header.PointerToSymbolTable +
             coff_header.NumberOfSymbols * sizeof(COFF::SymbolRecord));
         uint32_t string_table_size;
         file.read(reinterpret_cast<char*>(&string_table_size), sizeof(uint32_t));
 
-        std::vector<char> string_table(string_table_size);
-        file.read(string_table.data(), string_table_size);
+        std::cout << "String table size: " << string_table_size << " bytes" << std::endl;
+
+        // Read string table
+        std::vector<char> string_table;
+        if (string_table_size > sizeof(uint32_t)) {
+            string_table.resize(string_table_size - sizeof(uint32_t));
+            file.read(string_table.data(), string_table_size - sizeof(uint32_t));
+        }
 
         // Read symbols
         file.seekg(coff_header.PointerToSymbolTable);
-        for (uint32_t i = 0; i < coff_header.NumberOfSymbols; i++) {
+        std::cout << "\nParsing symbols:" << std::endl;
+
+        for (uint32_t i = 0; i < coff_header.NumberOfSymbols; ++i) {
             COFF::SymbolRecord symbol;
             file.read(reinterpret_cast<char*>(&symbol), sizeof(COFF::SymbolRecord));
 
             std::string name;
             if (symbol.Name.ShortName[0] == 0) {
-                // Long name - read from string table
-                name = read_string(string_table, symbol.Name.LongName.Offset);
+                // Long name from string table
+                uint32_t offset = symbol.Name.LongName.Offset;
+                if (offset < string_table.size()) {
+                    name = std::string(string_table.data() + offset);
+                    std::cout << "  Long name symbol at offset " << offset << ": " << name << std::endl;
+                }
             }
             else {
-                // Short name - directly from the record
-                name = std::string(symbol.Name.ShortName,
-                    strnlen(symbol.Name.ShortName, sizeof(symbol.Name.ShortName)));
+                // Short name directly from symbol record
+                char short_name[9] = { 0 }; // One extra for null termination
+                std::memcpy(short_name, symbol.Name.ShortName, 8);
+                name = short_name;
+                std::cout << "  Short name symbol: " << name << std::endl;
             }
 
-            Symbol sym{
-                name,
-                symbol.Value,
-                static_cast<uint16_t>(symbol.SectionNumber),
-                symbol.Type,
-                symbol.StorageClass,
-                symbol.NumberOfAuxSymbols
-            };
-            result.symbols.insert(sym);
+            if (!name.empty()) {
+                Symbol sym{
+                    name,
+                    symbol.Value,
+                    static_cast<uint16_t>(symbol.SectionNumber),
+                    symbol.Type,
+                    symbol.StorageClass,
+                    symbol.NumberOfAuxSymbols
+                };
+                result.symbols.insert(sym);
+
+                std::cout << "    Value: 0x" << std::hex << symbol.Value << std::dec << std::endl;
+                std::cout << "    Section: " << symbol.SectionNumber << std::endl;
+                std::cout << "    Type: 0x" << std::hex << symbol.Type << std::dec << std::endl;
+                std::cout << "    Storage Class: 0x" << std::hex << (int)symbol.StorageClass << std::dec << std::endl;
+                std::cout << "    Aux Symbols: " << (int)symbol.NumberOfAuxSymbols << std::endl;
+            }
 
             // Skip auxiliary symbol records
             i += symbol.NumberOfAuxSymbols;
+            file.seekg(symbol.NumberOfAuxSymbols * sizeof(COFF::SymbolRecord), std::ios::cur);
         }
+
+        std::cout << "\nTotal symbols parsed: " << result.symbols.size() << std::endl;
 
         // Read sections
         for (const auto& header : section_headers) {
@@ -364,11 +379,22 @@ json compare_obj_files(const ObjFile& obj1, const ObjFile& obj2) {
     json diff;
 
     // Compare symbols
-    json symbol_diff;
     std::set<std::string> all_symbol_names;
-    for (const auto& sym : obj1.symbols) all_symbol_names.insert(sym.name);
-    for (const auto& sym : obj2.symbols) all_symbol_names.insert(sym.name);
+    json symbol_diff;
 
+    // Collect all symbol names
+    for (const auto& sym : obj1.symbols) {
+        if (!sym.name.empty()) {  // Only process non-empty symbol names
+            all_symbol_names.insert(sym.name);
+        }
+    }
+    for (const auto& sym : obj2.symbols) {
+        if (!sym.name.empty()) {  // Only process non-empty symbol names
+            all_symbol_names.insert(sym.name);
+        }
+    }
+
+    // Compare symbols
     for (const auto& name : all_symbol_names) {
         auto it1 = std::find_if(obj1.symbols.begin(), obj1.symbols.end(),
             [&name](const Symbol& s) { return s.name == name; });
@@ -376,29 +402,27 @@ json compare_obj_files(const ObjFile& obj1, const ObjFile& obj2) {
             [&name](const Symbol& s) { return s.name == name; });
 
         if (it1 == obj1.symbols.end()) {
-            symbol_diff[name] = "Only in file 2";
+            symbol_diff[name] = {
+                {"status", "added"},
+                {"symbol", it2->to_json()}
+            };
         }
         else if (it2 == obj2.symbols.end()) {
-            symbol_diff[name] = "Only in file 1";
+            symbol_diff[name] = {
+                {"status", "removed"},
+                {"symbol", it1->to_json()}
+            };
         }
         else if (!(*it1 == *it2)) {
             symbol_diff[name] = {
-                {"file1", {
-                    {"value", it1->value},
-                    {"section_number", it1->section_number},
-                    {"type", it1->type},
-                    {"storage_class", it1->storage_class}
-                }},
-                {"file2", {
-                    {"value", it2->value},
-                    {"section_number", it2->section_number},
-                    {"type", it2->type},
-                    {"storage_class", it2->storage_class}
-                }}
+                {"status", "modified"},
+                {"file1", it1->to_json()},
+                {"file2", it2->to_json()}
             };
         }
     }
 
+    // Only add symbols to diff if there are differences
     if (!symbol_diff.empty()) {
         diff["symbols"] = symbol_diff;
     }
